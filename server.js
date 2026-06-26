@@ -88,6 +88,7 @@ function saveAccount(account) {
 let adminAccount = loadOrInitAccount();
 
 app.disable('x-powered-by');
+app.set('trust proxy', 1); // Required for secure cookies behind Render's proxy
 app.use(express.json());
 app.use(
   session({
@@ -97,8 +98,8 @@ app.use(
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax',
-      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'none',  // Required for cross-domain (Netlify → Render)
+      secure: true,       // Required when sameSite is 'none'
       maxAge: 8 * 60 * 60 * 1000
     }
   })
