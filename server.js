@@ -1,31 +1,97 @@
 /**
- * Mattress World — Server (Render deployment)
- * --------------------------------------------------
- * API-only backend. The frontend is hosted separately on Netlify.
- * CORS is enabled so Netlify can call this API.
+ * Mattress World — Server
+ * MongoDB + Cloudinary image uploads
  */
 
 require('dotenv').config();
-const express = require('express');
-const session = require('express-session');
-const bcrypt = require('bcryptjs');
-const fs = require('fs');
-const path = require('path');
+const express      = require('express');
+const session      = require('express-session');
+const MongoStore   = require('connect-mongo');
+const mongoose     = require('mongoose');
+const bcrypt       = require('bcryptjs');
+const multer       = require('multer');
+const cloudinary   = require('cloudinary').v2;
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3000;
-const DATA_FILE = path.join(__dirname, 'data', 'products.json');
-const ACCOUNT_FILE = path.join(__dirname, 'data', 'admin-account.json');
 
-/* ---------------------------------------------------------------------- */
-/* CORS — allow requests from your Netlify frontend                       */
-/* ---------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/* Cloudinary config                                                   */
+/* ------------------------------------------------------------------ */
+
+cloudinary.config({
+  cloud_name : process.env.CLOUDINARY_CLOUD_NAME,
+  api_key    : process.env.CLOUDINARY_API_KEY,
+  api_secret : process.env.CLOUDINARY_API_SECRET,
+});
+
+/* ------------------------------------------------------------------ */
+/* MongoDB + Mongoose                                                  */
+/* ------------------------------------------------------------------ */
+
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log('MongoDB connected'))
+  .catch(err => { console.error('MongoDB connection error:', err); process.exit(1); });
+
+const productSchema = new mongoose.Schema({
+  title       : { type: String, required: true },
+  description : { type: String, default: '' },
+  image       : { type: String, default: '' },
+  affiliateUrl: { type: String, default: '#' },
+  buttonText  : { type: String, default: 'See Price' },
+  rating      : { type: Number, default: 0, min: 0, max: 5 },
+  ratingCount : { type: String, default: '' },
+  badge       : { type: String, default: '' },
+  badgeColor  : { type: String, default: 'dark' },
+  specs       : { type: Array, default: [] },
+  order       : { type: Number, default: 0 },
+}, { timestamps: true });
+
+const Product = mongoose.model('Product', productSchema);
+
+const adminSchema = new mongoose.Schema({
+  username        : String,
+  passwordHash    : String,
+  recoveryCodeHash: String,
+}, { timestamps: true });
+
+const Admin = mongoose.model('Admin', adminSchema);
+
+/* ------------------------------------------------------------------ */
+/* Ensure admin account exists on startup                             */
+/* ------------------------------------------------------------------ */
+
+async function ensureAdmin() {
+  let account = await Admin.findOne();
+  if (account) {
+    // Add recovery code if missing
+    if (!account.recoveryCodeHash && process.env.RECOVERY_CODE) {
+      account.recoveryCodeHash = bcrypt.hashSync(process.env.RECOVERY_CODE, 10);
+      await account.save();
+    }
+    return;
+  }
+
+  const username     = process.env.ADMIN_USERNAME || 'admin';
+  const password     = process.env.ADMIN_PASSWORD;
+  if (!password) {
+    console.warn('[mattress-world] WARNING: ADMIN_PASSWORD not set. Admin login disabled until you set it and restart.');
+  }
+  const passwordHash     = password ? bcrypt.hashSync(password, 10) : null;
+  const recoveryCodeHash = process.env.RECOVERY_CODE ? bcrypt.hashSync(process.env.RECOVERY_CODE, 10) : null;
+
+  await Admin.create({ username, passwordHash, recoveryCodeHash });
+  console.log(`Admin account created: ${username}`);
+}
+
+/* ------------------------------------------------------------------ */
+/* CORS                                                                */
+/* ------------------------------------------------------------------ */
 
 const ALLOWED_ORIGIN = process.env.FRONTEND_URL || '';
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  // Allow the configured Netlify URL, or any origin if FRONTEND_URL is not set (dev mode)
   if (!ALLOWED_ORIGIN || origin === ALLOWED_ORIGIN) {
     res.setHeader('Access-Control-Allow-Origin', origin || '*');
   }
@@ -36,119 +102,44 @@ app.use((req, res, next) => {
   next();
 });
 
-/* ---------------------------------------------------------------------- */
-/* Admin account                                                          */
-/* ---------------------------------------------------------------------- */
-
-function loadOrInitAccount() {
-  let account = null;
-  try {
-    account = JSON.parse(fs.readFileSync(ACCOUNT_FILE, 'utf-8'));
-  } catch {
-    account = null;
-  }
-
-  if (!account) {
-    const username = process.env.ADMIN_USERNAME || 'admin';
-    const passwordHash =
-      process.env.ADMIN_PASSWORD_HASH ||
-      (process.env.ADMIN_PASSWORD ? bcrypt.hashSync(process.env.ADMIN_PASSWORD, 10) : null);
-
-    if (!passwordHash) {
-      console.warn(
-        '\n[mattress-world] WARNING: No ADMIN_PASSWORD or ADMIN_PASSWORD_HASH set in .env.\n' +
-        'The admin panel login will reject every attempt until you set one and restart.\n'
-      );
-    }
-
-    account = {
-      username,
-      passwordHash: passwordHash || null,
-      recoveryCodeHash: process.env.RECOVERY_CODE ? bcrypt.hashSync(process.env.RECOVERY_CODE, 10) : null,
-      updatedAt: new Date().toISOString()
-    };
-    fs.mkdirSync(path.dirname(ACCOUNT_FILE), { recursive: true });
-    fs.writeFileSync(ACCOUNT_FILE, JSON.stringify(account, null, 2));
-    return account;
-  }
-
-  if (!account.recoveryCodeHash && process.env.RECOVERY_CODE) {
-    account.recoveryCodeHash = bcrypt.hashSync(process.env.RECOVERY_CODE, 10);
-    account.updatedAt = new Date().toISOString();
-    fs.writeFileSync(ACCOUNT_FILE, JSON.stringify(account, null, 2));
-  }
-
-  return account;
-}
-
-function saveAccount(account) {
-  fs.writeFileSync(ACCOUNT_FILE, JSON.stringify(account, null, 2));
-}
-
-let adminAccount = loadOrInitAccount();
+/* ------------------------------------------------------------------ */
+/* Middleware                                                          */
+/* ------------------------------------------------------------------ */
 
 app.disable('x-powered-by');
-app.set('trust proxy', 1); // Required for secure cookies behind Render's proxy
+app.set('trust proxy', 1);
 app.use(express.json());
-app.use(
-  session({
-    name: 'mw.sid',
-    secret: process.env.SESSION_SECRET || 'please-change-this-secret-before-launch',
-    resave: false,
-    saveUninitialized: false,
-    cookie: {
-      httpOnly: true,
-      sameSite: 'none',  // Required for cross-domain (Netlify → Render)
-      secure: true,       // Required when sameSite is 'none'
-      maxAge: 8 * 60 * 60 * 1000
-    }
-  })
-);
 
-/* ---------------------------------------------------------------------- */
-/* Data helpers                                                           */
-/* ---------------------------------------------------------------------- */
+app.use(session({
+  name  : 'mw.sid',
+  secret: process.env.SESSION_SECRET || 'please-change-this-secret',
+  resave: false,
+  saveUninitialized: false,
+  store : MongoStore.create({
+    mongoUrl   : process.env.MONGODB_URI,
+    ttl        : 8 * 60 * 60,        // 8 hours
+    autoRemove : 'native',
+  }),
+  cookie: {
+    httpOnly : true,
+    sameSite : 'none',
+    secure   : true,
+    maxAge   : 8 * 60 * 60 * 1000,
+  },
+}));
 
-function readProducts() {
-  try {
-    const raw = fs.readFileSync(DATA_FILE, 'utf-8');
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch (err) {
-    console.error('[mattress-world] Could not read products.json:', err.message);
-    return [];
-  }
-}
-
-function writeProducts(products) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(products, null, 2));
-}
-
-function makeId() {
-  return 'p_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-}
-
-/* ---------------------------------------------------------------------- */
-/* Auth middleware                                                        */
-/* ---------------------------------------------------------------------- */
-
-function requireAuth(req, res, next) {
-  if (req.session && req.session.isAdmin) return next();
-  return res.status(401).json({ error: 'You must be logged in as admin to do this.' });
-}
-
-/* ---------------------------------------------------------------------- */
-/* Rate limiting                                                          */
-/* ---------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/* Rate limiter                                                        */
+/* ------------------------------------------------------------------ */
 
 const MAX_ATTEMPTS = 8;
-const WINDOW_MS = 10 * 60 * 1000;
+const WINDOW_MS    = 10 * 60 * 1000;
 
 function makeRateLimiter() {
   const attempts = new Map();
   return {
     middleware(req, res, next) {
-      const ip = req.ip;
+      const ip  = req.ip;
       const now = Date.now();
       const entry = attempts.get(ip);
       if (!entry || now > entry.resetAt) {
@@ -162,29 +153,68 @@ function makeRateLimiter() {
       entry.count += 1;
       next();
     },
-    reset(ip) {
-      attempts.delete(ip);
-    }
+    reset(ip) { attempts.delete(ip); },
   };
 }
 
-const loginLimiter = makeRateLimiter();
+const loginLimiter          = makeRateLimiter();
 const forgotPasswordLimiter = makeRateLimiter();
 
-/* ---------------------------------------------------------------------- */
-/* Auth routes                                                            */
-/* ---------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/* Auth middleware                                                     */
+/* ------------------------------------------------------------------ */
 
-app.post('/api/login', loginLimiter.middleware, (req, res) => {
+function requireAuth(req, res, next) {
+  if (req.session && req.session.isAdmin) return next();
+  return res.status(401).json({ error: 'You must be logged in as admin.' });
+}
+
+/* ------------------------------------------------------------------ */
+/* Image upload via Cloudinary                                        */
+/* ------------------------------------------------------------------ */
+
+// Store file in memory, then stream to Cloudinary
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits : { fileSize: 5 * 1024 * 1024 }, // 5 MB max
+  fileFilter(req, file, cb) {
+    if (file.mimetype.startsWith('image/')) cb(null, true);
+    else cb(new Error('Only image files are allowed.'));
+  },
+});
+
+// POST /api/upload  (admin only)
+app.post('/api/upload', requireAuth, upload.single('image'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No image file provided.' });
+
+  try {
+    const result = await new Promise((resolve, reject) => {
+      const stream = cloudinary.uploader.upload_stream(
+        { folder: 'mattress-world', resource_type: 'image' },
+        (err, result) => err ? reject(err) : resolve(result)
+      );
+      stream.end(req.file.buffer);
+    });
+    res.json({ url: result.secure_url });
+  } catch (err) {
+    console.error('Cloudinary upload error:', err);
+    res.status(500).json({ error: 'Image upload failed. Check Cloudinary credentials.' });
+  }
+});
+
+/* ------------------------------------------------------------------ */
+/* Auth routes                                                         */
+/* ------------------------------------------------------------------ */
+
+app.post('/api/login', loginLimiter.middleware, async (req, res) => {
   const { username, password } = req.body || {};
-  if (!adminAccount.passwordHash) {
-    return res.status(500).json({ error: 'Admin login is not configured on the server yet.' });
+  const account = await Admin.findOne();
+  if (!account || !account.passwordHash) {
+    return res.status(500).json({ error: 'Admin login not configured.' });
   }
-  const validUsername = username === adminAccount.username;
-  const validPassword = validUsername && bcrypt.compareSync(String(password || ''), adminAccount.passwordHash);
-  if (!validUsername || !validPassword) {
-    return res.status(401).json({ error: 'Incorrect username or password.' });
-  }
+  const valid = username === account.username && bcrypt.compareSync(String(password || ''), account.passwordHash);
+  if (!valid) return res.status(401).json({ error: 'Incorrect username or password.' });
+
   req.session.isAdmin = true;
   loginLimiter.reset(req.ip);
   res.json({ ok: true });
@@ -198,112 +228,98 @@ app.get('/api/session', (req, res) => {
   res.json({ isAdmin: !!(req.session && req.session.isAdmin) });
 });
 
-app.post('/api/forgot-password', forgotPasswordLimiter.middleware, (req, res) => {
+app.post('/api/forgot-password', forgotPasswordLimiter.middleware, async (req, res) => {
   const { username, recoveryCode, newPassword } = req.body || {};
-  if (!adminAccount.recoveryCodeHash) {
-    return res.status(500).json({ error: 'Password recovery is not set up. Add RECOVERY_CODE to .env and restart.' });
+  const account = await Admin.findOne();
+  if (!account || !account.recoveryCodeHash) {
+    return res.status(500).json({ error: 'Password recovery not set up. Add RECOVERY_CODE to env vars.' });
   }
   if (!newPassword || String(newPassword).length < 8) {
     return res.status(400).json({ error: 'New password must be at least 8 characters.' });
   }
-  const validUsername = username === adminAccount.username;
-  const validCode = validUsername && bcrypt.compareSync(String(recoveryCode || ''), adminAccount.recoveryCodeHash);
-  if (!validUsername || !validCode) {
-    return res.status(401).json({ error: 'Incorrect username or recovery code.' });
-  }
-  adminAccount.passwordHash = bcrypt.hashSync(String(newPassword), 10);
-  adminAccount.updatedAt = new Date().toISOString();
-  saveAccount(adminAccount);
+  const valid = username === account.username && bcrypt.compareSync(String(recoveryCode || ''), account.recoveryCodeHash);
+  if (!valid) return res.status(401).json({ error: 'Incorrect username or recovery code.' });
+
+  account.passwordHash = bcrypt.hashSync(String(newPassword), 10);
+  await account.save();
   forgotPasswordLimiter.reset(req.ip);
   res.json({ ok: true });
 });
 
-/* ---------------------------------------------------------------------- */
-/* Product routes                                                         */
-/* ---------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/* Product routes                                                      */
+/* ------------------------------------------------------------------ */
 
-app.get('/api/products', (req, res) => {
-  res.json(readProducts());
+app.get('/api/products', async (req, res) => {
+  const products = await Product.find().sort({ order: 1, createdAt: 1 });
+  res.json(products);
 });
 
-app.post('/api/products', requireAuth, (req, res) => {
+app.post('/api/products', requireAuth, async (req, res) => {
   const body = req.body || {};
   if (!body.title || !String(body.title).trim()) {
     return res.status(400).json({ error: 'Product name is required.' });
   }
-  const products = readProducts();
-  const product = {
-    id: makeId(),
-    title: String(body.title).trim(),
-    description: body.description || '',
-    image: body.image || '',
+  const count   = await Product.countDocuments();
+  const product = await Product.create({
+    title       : String(body.title).trim(),
+    description : body.description || '',
+    image       : body.image || '',
     affiliateUrl: body.affiliateUrl || '#',
-    buttonText: body.buttonText || 'See Price',
-    rating: Math.max(0, Math.min(5, Number(body.rating) || 0)),
-    ratingCount: body.ratingCount || '',
-    badge: body.badge || '',
-    badgeColor: body.badgeColor || 'dark',
-    specs: Array.isArray(body.specs) ? body.specs : []
-  };
-  products.push(product);
-  writeProducts(products);
+    buttonText  : body.buttonText || 'See Price',
+    rating      : Math.max(0, Math.min(5, Number(body.rating) || 0)),
+    ratingCount : body.ratingCount || '',
+    badge       : body.badge || '',
+    badgeColor  : body.badgeColor || 'dark',
+    specs       : Array.isArray(body.specs) ? body.specs : [],
+    order       : count,
+  });
   res.status(201).json(product);
 });
 
-app.put('/api/products/:id', requireAuth, (req, res) => {
-  const products = readProducts();
-  const idx = products.findIndex((p) => p.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: 'Product not found.' });
+app.put('/api/products/:id', requireAuth, async (req, res) => {
   const body = req.body || {};
   if (body.title !== undefined && !String(body.title).trim()) {
     return res.status(400).json({ error: 'Product name is required.' });
   }
-  products[idx] = {
-    ...products[idx],
-    ...body,
-    id: products[idx].id,
-    rating:
-      body.rating !== undefined
-        ? Math.max(0, Math.min(5, Number(body.rating) || 0))
-        : products[idx].rating
-  };
-  writeProducts(products);
-  res.json(products[idx]);
+  const product = await Product.findByIdAndUpdate(
+    req.params.id,
+    { ...body, ...(body.rating !== undefined && { rating: Math.max(0, Math.min(5, Number(body.rating) || 0)) }) },
+    { new: true }
+  );
+  if (!product) return res.status(404).json({ error: 'Product not found.' });
+  res.json(product);
 });
 
-app.delete('/api/products/:id', requireAuth, (req, res) => {
-  const products = readProducts();
-  const next = products.filter((p) => p.id !== req.params.id);
-  if (next.length === products.length) {
-    return res.status(404).json({ error: 'Product not found.' });
-  }
-  writeProducts(next);
+app.delete('/api/products/:id', requireAuth, async (req, res) => {
+  const product = await Product.findByIdAndDelete(req.params.id);
+  if (!product) return res.status(404).json({ error: 'Product not found.' });
   res.json({ ok: true });
 });
 
-app.put('/api/products-order', requireAuth, (req, res) => {
+app.put('/api/products-order', requireAuth, async (req, res) => {
   const { orderedIds } = req.body || {};
   if (!Array.isArray(orderedIds)) {
-    return res.status(400).json({ error: 'orderedIds must be an array of product ids.' });
+    return res.status(400).json({ error: 'orderedIds must be an array.' });
   }
-  const products = readProducts();
-  const byId = new Map(products.map((p) => [p.id, p]));
-  const reordered = orderedIds.map((id) => byId.get(id)).filter(Boolean);
-  const missing = products.filter((p) => !orderedIds.includes(p.id));
-  writeProducts([...reordered, ...missing]);
-  res.json(readProducts());
+  await Promise.all(orderedIds.map((id, index) => Product.findByIdAndUpdate(id, { order: index })));
+  const products = await Product.find().sort({ order: 1 });
+  res.json(products);
 });
 
-/* ---------------------------------------------------------------------- */
-/* Health check                                                           */
-/* ---------------------------------------------------------------------- */
+/* ------------------------------------------------------------------ */
+/* Health check                                                        */
+/* ------------------------------------------------------------------ */
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
-app.use((req, res) => {
-  res.status(404).json({ error: 'Not found.' });
-});
+app.use((req, res) => res.status(404).json({ error: 'Not found.' }));
 
-app.listen(PORT, () => {
-  console.log(`Mattress World API running at http://localhost:${PORT}`);
+/* ------------------------------------------------------------------ */
+/* Start                                                               */
+/* ------------------------------------------------------------------ */
+
+mongoose.connection.once('open', async () => {
+  await ensureAdmin();
+  app.listen(PORT, () => console.log(`Mattress World API running on port ${PORT}`));
 });

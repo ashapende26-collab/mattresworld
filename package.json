@@ -1,7 +1,7 @@
 {
   "name": "mattress-world",
   "version": "1.0.0",
-  "description": "Mattress World affiliate site with a real, login-protected admin panel.",
+  "description": "Mattress World affiliate site backend with MongoDB and Cloudinary image uploads.",
   "private": true,
   "main": "server.js",
   "scripts": {
@@ -13,8 +13,12 @@
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
+    "cloudinary": "^2.2.0",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "express-session": "^1.18.0"
+    "express-session": "^1.18.0",
+    "mongoose": "^8.4.0",
+    "multer": "^1.4.5-lts.1",
+    "connect-mongo": "^5.1.0"
   }
 }
